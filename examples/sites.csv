@@ -1,0 +1,3 @@
+url,brand,company,amazon_url,official_url,infringement,affects_buybox
+https://shop-one.example.com/products/a,Example Brand,Example Company,,https://brand.example.com/products/a,copyright+trademark,yes
+https://shop-two.example.org/products/b,Example Brand,Example Company,,https://brand.example.com/products/b,copyright,no

@@ -1,7 +1,7 @@
 ---
 name: independent-site-ip-investigator
 description: Investigate an allegedly infringing independent ecommerce site for Amazon sellers. Given a product URL or domain, identify registrar/RDAP abuse contacts, nameservers, CDN, likely ecommerce platform, visible hosting/ASN, possible payment providers, capture screenshots, support CSV batch runs, and generate Markdown/PDF reports plus DMCA, trademark, and Amazon Buy Box case drafts. Use for brand/IP enforcement, stolen product images, trademark misuse, fake stores, or external low-price pages affecting Amazon Featured Offer eligibility.
-version: 1.0.0
+version: 1.1.0
 platforms: [macos, linux]
 metadata:
   hermes:
@@ -61,14 +61,33 @@ For screenshots:
 python -m playwright install chromium
 ```
 
-For optional OpenAI-generated reports, set:
+Reports are deterministic by default (`--llm none`), even when API keys are set.
+To opt into OpenAI reports, install its optional SDK and set both variables:
 
 ```bash
+pip install openai
 export OPENAI_API_KEY="your_api_key"
-export OPENAI_MODEL="gpt-5.5"
+export OPENAI_MODEL="your_model_id"
 ```
 
-If `OPENAI_API_KEY` is missing, the script still generates structured JSON and a deterministic Markdown report.
+Then pass `--llm openai`. For Anthropic reports, use:
+
+```bash
+pip install anthropic
+export ANTHROPIC_API_KEY="your_api_key"
+export ANTHROPIC_MODEL="your_model_id"
+```
+
+Then pass `--llm anthropic`. No model is selected automatically. Missing configuration,
+an unavailable SDK, or an API failure produces a warning on stderr and falls back to
+the deterministic report; errors are not inserted into the report.
+
+For development tests:
+
+```bash
+pip install -r requirements-dev.txt
+python3 -m pytest -q
+```
 
 ## Single-URL Procedure
 
@@ -76,13 +95,14 @@ Run:
 
 ```bash
 python scripts/site_ip_investigator.py \
-  --url "https://example-store.com/products/abc" \
+  --url "https://shop.example.com/products/abc" \
   --brand "Brand Name" \
   --company "Company Name LLC" \
   --amazon-url "https://www.amazon.com/dp/B0XXXXXXX" \
-  --official-url "https://brand.com/products/abc" \
+  --official-url "https://brand.example.com/products/abc" \
   --infringement "copyright+trademark" \
   --affects-buybox yes \
+  --lang en \
   --screenshots \
   --pdf
 ```
@@ -92,22 +112,37 @@ Expected outputs under `reports/<domain>_<timestamp>/`:
 - `investigation.json` — raw structured evidence
 - `report.md` — human-readable report
 - `report.pdf` — optional PDF if PDF dependencies are available
-- `screenshots/homepage.png` and/or `screenshots/page_full.png` when screenshotting succeeds
+- `screenshots/page_full.png` when screenshotting succeeds
+
+### CLI options
+
+- Use exactly one of `--url URL_OR_DOMAIN` or `--csv PATH`. Bare IP addresses are
+  accepted; domain RDAP is skipped for them and noted in the report.
+- `--lang en|zh` selects the report and batch Markdown summary language (default:
+  `en`). Complaint templates stay in English and contain the final page URL, or
+  the input URL if the request failed.
+- `--llm openai|anthropic|none` selects an optional report provider (default:
+  `none`). The legacy `--no-llm` flag remains accepted as an alias for `--llm none`.
+- `--screenshots` enables Playwright screenshots; `--pdf` enables PDF output.
+- `--output-dir PATH` sets the output root (default: `reports`).
+- `--brand`, `--company`, `--amazon-url`, `--official-url`, `--infringement`, and
+  `--affects-buybox` supply the single-site report context shown above.
+- `--version` prints `1.1.0`; `--help` lists the supported CLI options.
 
 ## Batch Procedure
 
-Prepare a CSV:
+Use `examples/sites.csv` or prepare a CSV with placeholder values replaced by your inputs:
 
 ```csv
 url,brand,company,amazon_url,official_url,infringement,affects_buybox
-https://site1.com/products/a,ABC,ABC LLC,https://amazon.com/dp/B0XXX,https://abc.com/a,copyright+trademark,yes
-https://site2.com/products/b,ABC,ABC LLC,https://amazon.com/dp/B0YYY,https://abc.com/b,copyright,yes
+https://shop-one.example.com/products/a,Example Brand,Example Company,,https://brand.example.com/products/a,copyright+trademark,yes
+https://shop-two.example.org/products/b,Example Brand,Example Company,,https://brand.example.com/products/b,copyright,no
 ```
 
 Run:
 
 ```bash
-python scripts/site_ip_investigator.py --csv input.csv --screenshots --pdf
+python scripts/site_ip_investigator.py --csv examples/sites.csv --lang en --screenshots --pdf
 ```
 
 Outputs:
@@ -115,7 +150,12 @@ Outputs:
 - One report folder per site
 - `reports/batch_<timestamp>/batch_summary.csv`
 - `reports/batch_<timestamp>/batch_summary.md`
-- Optional LLM-generated batch summary if `OPENAI_API_KEY` is set
+- A deterministic batch Markdown summary in the selected `--lang`
+- An `error` column records failed rows; subsequent rows still run
+
+Pass `--llm openai` or `--llm anthropic` to request LLM reports for individual sites
+in the batch. The summary remains deterministic, and CSV field names remain stable
+in both languages.
 
 ## Interpreting Results
 
