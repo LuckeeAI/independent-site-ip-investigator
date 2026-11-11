@@ -40,7 +40,7 @@ def test_cli_language_renders_all_eleven_sections(lang, headings, sample_data, t
     paths = inv.save_single_report(sample_data, tmp_path, llm=args.llm, lang=args.lang)
     report = Path(paths["markdown"]).read_text(encoding="utf-8")
     assert re.findall(r"^## (.+)$", report, re.MULTILINE) == [f"{number}. {title}" for number, title in enumerate(headings, 1)]
-    assert report.count(f"Infringing Page URL: {sample_data['http']['final_url']}") == 3
+    assert report.count(f"Infringing Page URL: {sample_data['input_url']}") == 3
     assert "Dear Legal / Abuse Team" in report
     assert "Dear Amazon Seller Support Team" in report
 
@@ -68,7 +68,7 @@ def test_cli_version_does_not_require_target(capsys):
     with pytest.raises(SystemExit) as exc:
         inv.build_parser().parse_args(["--version"])
     assert exc.value.code == 0
-    assert "1.1.0" in capsys.readouterr().out
+    assert "1.2.0" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("lang,title", [("en", "Batch Investigation Summary"), ("zh", "批量调查汇总")])
@@ -90,13 +90,16 @@ def test_batch_continues_after_failing_first_row(monkeypatch, tmp_path, sample_d
         rows = list(csv.DictReader(handle))
     assert len(rows) == 2
     assert rows[0]["url"] == seen[0]
-    assert "simulated lookup failure" in rows[0]["error"]
+    assert rows[0]["error"] == "request failed"
+    record = Path(rows[0]["output_dir"]) / "investigation.json"
+    assert "simulated lookup failure" in record.read_text(encoding="utf-8")
     assert rows[1]["url"] == seen[1]
     assert rows[1]["error"] == ""
     assert Path(rows[1]["report_md"]).is_file()
     summary = summary_path.with_suffix(".md").read_text(encoding="utf-8")
     assert title in summary
-    assert "simulated lookup failure" in summary
+    assert "request failed" in summary
+    assert "simulated lookup failure" not in summary
 
 
 def test_llm_is_opt_in_even_when_credentials_exist(monkeypatch, sample_data):

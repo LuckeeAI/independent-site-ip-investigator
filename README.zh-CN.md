@@ -42,6 +42,8 @@
 
 ## 快速开始
 
+运行调查前，请将下面的占位网址、品牌、公司和 ASIN 替换为你的实际信息。
+
 ```bash
 git clone https://github.com/LuckeeAI/independent-site-ip-investigator.git
 cd independent-site-ip-investigator
@@ -52,21 +54,23 @@ python scripts/site_ip_investigator.py \
   --brand "Your Brand" \
   --company "Your Company LLC" \
   --amazon-url "https://www.amazon.com/dp/B0XXXXXXXX" \
-  --official-url "https://yourbrand.com/products/your-product" \
+  --official-url "https://brand.example.com/products/your-product" \
   --lang zh
 ```
 
-报告保存在 `reports/<域名>_<时间>/report.md`。加 `--screenshots` 会截取整页（需先运行一次 `python -m playwright install chromium`），加 `--pdf` 会生成 PDF。投诉信模板始终是英文，因为要提交给海外平台。
+报告保存在 `reports/<hostname>_<timestamp>/report.md`，目录名使用完整主机名，并将点和冒号替换为下划线。加 `--screenshots` 会截取整页（需先运行一次 `python -m playwright install chromium`），加 `--pdf` 会生成 PDF。PDF 用的是 WeasyPrint，需要先装系统库：macOS 运行 `brew install pango`，Ubuntu/Debian 运行 `apt install libpango-1.0-0 libpangoft2-1.0-0`。任何 PDF 失败都会向 stderr 输出可读警告，并保留 Markdown 报告；缺少 Python 包时提示 `pip install markdown2 weasyprint`，缺少系统库时提示上述平台安装步骤。投诉信模板始终是英文，因为要提交给海外平台。
+
+中文 PDF 还需要覆盖中文字符的字体。若出现方块或缺字，请安装中文字体后重新生成。
 
 ### 批量调查
 
-把网址放进 CSV（参考 [`examples/sites.csv`](examples/sites.csv)）：
+把网址放进 CSV（参考 [`examples/sites.csv`](examples/sites.csv)，使用前需替换其中的占位值）：
 
 ```bash
 python scripts/site_ip_investigator.py --csv sites.csv --lang zh --screenshots
 ```
 
-每个网站生成一个报告文件夹，另外汇总成 `batch_summary.csv` 和 `batch_summary.md`。某个网站打不开不会中断整批任务，错误会记在它那一行。
+每行生成一个调查文件夹，并在 `reports/batch_<timestamp>/` 下汇总成 `batch_summary.csv` 和 `batch_summary.md`。非法输入及无法确认存在的主机会保留 `investigation.json` 错误记录，不生成投诉报告。单行失败不会中断后续行。PDF 错误会加入 `error` 列，同时保留已有 HTTP 错误，并计入出错行数；Markdown 报告仍可使用。只要整批处理完成，退出码就是 `0`，即使部分或全部行失败，因此仍须检查 `error` 列。
 
 ### 作为 agent skill 使用
 
@@ -74,18 +78,28 @@ python scripts/site_ip_investigator.py --csv sites.csv --lang zh --screenshots
 
 ## 示例：挂了 Cloudflare 的 Shopify 店
 
+以下是示意输出，域名和联系方式均为占位值：
+
 ```json
 {
-  "domain": "brand-store.com",
-  "registrar": "MarkMonitor Inc.",
-  "abuse_email": "abusecomplaints@markmonitor.com",
-  "cdn": ["Cloudflare", "Shopify CDN"],
+  "domain": "example.com",
+  "hostname": "store.example.com",
+  "registrable_domain": "example.com",
+  "registrar": "Example Registrar",
+  "abuse_email": "abuse@registrar.example",
+  "cdn": ["Cloudflare"],
   "platform": ["Shopify"],
   "hosting_status": "platform_hosted"
 }
 ```
 
-这是对一个正规品牌自营 Shopify 店的真实查询结果，域名已隐去。虽然前面挂着 Cloudflare，但 DNS 指向 Shopify，所以工具判断主机就是 Shopify，并把 Shopify 的举报表单排在投诉顺序第一位，因为平台可以直接下架店铺的商品页。
+这个示例中，网站前面挂着 Cloudflare，DNS 指向 Shopify，因此工具将 Shopify 识别为主机，并把它的举报表单排在投诉顺序第一位。识别出 Shopify 平台后，CDN 列表会去掉重复的 Shopify CDN。平台识别结果本身不构成侵权认定。
+
+### 开在平台二级域名上的店
+
+很多仿品店根本不买域名，直接用 `your-brand-deals.myshopify.com`、`xxx.wixsite.com` 这样的地址。工具能识别这种情况，并提示你直接向平台投诉。如果去找 `myshopify.com` 的注册商，投诉只会到 Shopify 自己的域名注册商那里。
+
+非法网址的退出码为 `2`。只有 DNS 没有 A/AAAA/CNAME 记录、RDAP 没有提供注册证据且未收到 HTTP 响应时，工具才会判定无法确认该主机存在：保留 `investigation.json`，跳过投诉报告，单站模式退出码为 `3`。请检查网址和网络后重试；查询失败不代表域名未注册。只要 DNS 或 RDAP 提供了证据，或收到任何 HTTP 响应（包括 403/404/503），就会继续生成报告；页面未能成功加载时，报告会提示你在投诉前自行截图取证。
 
 ## 先投诉哪里
 
@@ -107,7 +121,7 @@ python scripts/site_ip_investigator.py --csv sites.csv --lang zh --screenshots
 
 ## 可选：让 AI 写报告
 
-默认报告完全根据数据生成，不调用任何 AI。如果想让模型基于同样的证据写一份更完整的叙述：
+默认使用 `--llm none`，即使设置了 API 密钥也不会调用模型。如果想让模型基于同样的证据写一份更完整的叙述：
 
 ```bash
 pip install anthropic          # 或 pip install openai
@@ -144,7 +158,7 @@ python scripts/site_ip_investigator.py --url ... --llm anthropic --lang zh
 ## 开发
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest -q
 ```
 

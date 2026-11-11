@@ -42,6 +42,8 @@ It never submits anything. You review the drafts and file them yourself.
 
 ## Quick start
 
+Replace the placeholder URLs, brand, company and ASIN below with your own inputs before running the investigation.
+
 ```bash
 git clone https://github.com/LuckeeAI/independent-site-ip-investigator.git
 cd independent-site-ip-investigator
@@ -52,20 +54,22 @@ python scripts/site_ip_investigator.py \
   --brand "Your Brand" \
   --company "Your Company LLC" \
   --amazon-url "https://www.amazon.com/dp/B0XXXXXXXX" \
-  --official-url "https://yourbrand.com/products/your-product"
+  --official-url "https://brand.example.com/products/your-product"
 ```
 
-The report lands in `reports/<domain>_<timestamp>/report.md`. Add `--lang zh` for a Chinese report, `--screenshots` for a full-page capture (run `python -m playwright install chromium` once), and `--pdf` for a PDF.
+The report lands in `reports/<hostname>_<timestamp>/report.md`, using the full hostname with dots and colons replaced by underscores. Add `--lang zh` for a Chinese report, `--screenshots` for a full-page capture (run `python -m playwright install chromium` once), and `--pdf` for a PDF. PDF output uses WeasyPrint, which needs system libraries: `brew install pango` on macOS, `apt install libpango-1.0-0 libpangoft2-1.0-0` on Ubuntu/Debian. Every PDF failure prints a readable warning to stderr and preserves the Markdown report; missing Python packages prompt `pip install markdown2 weasyprint`, and missing system libraries prompt the platform-specific steps above.
+
+Chinese PDF output also requires a font with Chinese glyph coverage. If characters are missing, install a suitable font and regenerate the PDF.
 
 ### Many sites at once
 
-Put the URLs in a CSV (see [`examples/sites.csv`](examples/sites.csv)):
+Put the URLs in a CSV (see [`examples/sites.csv`](examples/sites.csv), whose placeholder values must be replaced):
 
 ```bash
 python scripts/site_ip_investigator.py --csv sites.csv --screenshots
 ```
 
-You get one report folder per site plus `batch_summary.csv` and `batch_summary.md`. A site that fails to load doesn't stop the batch; its row records the error.
+You get one investigation folder per row plus `batch_summary.csv` and `batch_summary.md` under `reports/batch_<timestamp>/`. Invalid inputs and hosts that cannot be confirmed retain an `investigation.json` error record without a complaint report. Row failures do not stop later rows. PDF errors are added to the `error` column alongside any HTTP error and count toward rows with errors; Markdown reports remain available. A completed batch exits with status `0` even when some or all rows fail, so always inspect the `error` column.
 
 ### As an agent skill
 
@@ -73,18 +77,28 @@ Copy the folder into your agent's skills directory, for example `~/.claude/skill
 
 ## Example: a Shopify store behind Cloudflare
 
+Illustrative output, with placeholder domain and contact details:
+
 ```json
 {
-  "domain": "brand-store.com",
-  "registrar": "MarkMonitor Inc.",
-  "abuse_email": "abusecomplaints@markmonitor.com",
-  "cdn": ["Cloudflare", "Shopify CDN"],
+  "domain": "example.com",
+  "hostname": "store.example.com",
+  "registrable_domain": "example.com",
+  "registrar": "Example Registrar",
+  "abuse_email": "abuse@registrar.example",
+  "cdn": ["Cloudflare"],
   "platform": ["Shopify"],
   "hosting_status": "platform_hosted"
 }
 ```
 
-This is real output from a legitimate brand's own Shopify store, with the domain masked. Cloudflare is in front, but the DNS points to Shopify, so the tool reports Shopify as the host. Shopify's report form goes to the top of the complaint order, because the platform can take a store's product pages down directly.
+In this example, Cloudflare is in front and DNS points to Shopify, so the tool reports Shopify as the host and puts its report form first. When Shopify is identified as the platform, the duplicate Shopify CDN finding is omitted. Platform detection alone does not establish infringement.
+
+### Stores on a platform's own domain
+
+Many copycat stores never buy a domain and run on addresses like `your-brand-deals.myshopify.com` or `xxx.wixsite.com`. The tool recognises these and tells you to report the store to the platform directly. Complaining to the registrar of `myshopify.com` would only reach Shopify's own domain registrar.
+
+Invalid URLs exit with status `2`. If DNS provides no A/AAAA/CNAME records, RDAP provides no registration evidence, and no HTTP response is received, the tool cannot confirm the host: it saves `investigation.json`, skips the complaint report and exits with status `3` in single-site mode. Check the URL and network, then retry; lookup failures do not prove the domain is unregistered. DNS or RDAP evidence, or any HTTP response (including 403/404/503), is enough to continue. If the page could not be loaded successfully, the report warns you to capture your own screenshot before filing.
 
 ## Which complaint goes first
 
@@ -106,7 +120,7 @@ This is real output from a legitimate brand's own Shopify store, with the domain
 
 ## Optional: AI-written report
 
-The default report is generated from the data with no AI involved. To have a model write a fuller narrative from the same evidence:
+The default report uses `--llm none` and makes no model calls, even when API keys are set. To have a model write a fuller narrative from the same evidence:
 
 ```bash
 pip install anthropic          # or: pip install openai
@@ -143,7 +157,7 @@ While you don't have the Featured Offer, your Sponsored Products ads don't serve
 ## Development
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest -q
 ```
 

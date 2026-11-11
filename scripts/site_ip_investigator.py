@@ -15,10 +15,13 @@ No automated complaint submission is performed.
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
 import csv
 import dataclasses
 import datetime as dt
+import errno
 import ipaddress
+import io
 import json
 import os
 import re
@@ -38,11 +41,28 @@ try:
 except Exception:
     pass
 
-USER_AGENT = "IndependentSiteIPInvestigator/1.1 (+https://github.com/LuckeeAI/independent-site-ip-investigator)"
+VERSION = "1.2.0"
+USER_AGENT = f"IndependentSiteIPInvestigator/{VERSION} (+https://github.com/LuckeeAI/independent-site-ip-investigator)"
 REQUEST_TIMEOUT = 20
 MAX_HTML_CHARS = 700_000
 # Use tldextract's bundled public suffix snapshot without downloading a list.
 DOMAIN_EXTRACTOR = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
+
+# Only platform-owned storefront domains; match a complete subdomain boundary.
+SHARED_PLATFORM_SUFFIXES = {
+    "myshopify.com": "Shopify",
+    "wixsite.com": "Wix",
+    "squarespace.com": "Squarespace",
+    "square.site": "Square Online",
+    "mybigcommerce.com": "BigCommerce",
+    "myshoplaza.com": "Shoplazza",
+    "shoplineapp.com": "Shopline",
+    "myshopline.com": "Shopline",
+    "wordpress.com": "WordPress.com",
+    "weebly.com": "Weebly",
+    "ecwid.com": "Ecwid",
+    "company.site": "Ecwid",
+}
 
 # Cloudflare's published IPv4 ranges, https://www.cloudflare.com/ips-v4
 # Retrieved 2026-11-09. Keep this list in sync when updating infrastructure rules.
@@ -129,19 +149,88 @@ def utc_timestamp() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S_UTC")
 
 
+class InvalidTarget(ValueError):
+    """A URL/domain rejected before any network requests are made."""
+
+
 def normalize_url(value: str) -> str:
-    value = (value or "").strip()
-    if not value:
-        raise ValueError("URL/domain is required")
+    original = (value or "").strip()
+    value = original
+    invalid = InvalidTarget(f"{original!r} is not a valid URL or domain")
+    if not value or any(char in value for char in "\r\n\t"):
+        raise invalid
     try:
         address = ipaddress.ip_address(value)
     except ValueError:
         pass
     else:
-        return f"https://[{value}]" if address.version == 6 else f"https://{value}"
-    if not re.match(r"^https?://", value, re.I):
+        return f"https://[{address}]" if address.version == 6 else f"https://{address}"
+    if "://" not in value:
         value = "https://" + value
-    return value
+    try:
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower().removesuffix(".")
+        port = parsed.port  # Validate malformed and out-of-range ports too.
+        if parsed.scheme.lower() not in {"http", "https"} or not host:
+            raise invalid
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            if len(host) > 253 or "." not in host or not all(
+                re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                for label in host.split(".")
+            ):
+                raise invalid
+            netloc = host
+        else:
+            netloc = f"[{address}]" if address.version == 6 else str(address)
+        if port is not None:
+            netloc += f":{port}"
+        if "@" in parsed.netloc:
+            netloc = parsed.netloc.rsplit("@", 1)[0] + "@" + netloc
+        return parsed._replace(scheme=parsed.scheme.lower(), netloc=netloc).geturl()
+    except ValueError:
+        raise invalid from None
+
+
+def shared_platform_for_host(hostname: str) -> Optional[str]:
+    hostname = hostname.lower().rstrip(".")
+    return next((platform for suffix, platform in SHARED_PLATFORM_SUFFIXES.items()
+                 if hostname.endswith("." + suffix)), None)
+
+
+def readable_error(error: Any, status_code: Optional[int] = None) -> str:
+    """Keep transport internals in JSON, using brief messages in user output."""
+    if status_code is None and isinstance(error, requests.HTTPError):
+        status_code = getattr(error.response, "status_code", None)
+    if status_code is not None and status_code >= 400:
+        return f"HTTP {status_code}"
+    if isinstance(error, InvalidTarget):
+        return str(error)
+    message = str(error or "").lower()
+    if isinstance(error, (requests.exceptions.SSLError,)) or any(
+        term in message for term in ("ssl", "certificate verify failed", "certificate_verify_failed")
+    ):
+        return "SSL certificate error"
+    if isinstance(error, (requests.Timeout, TimeoutError, dns.exception.Timeout)) or any(
+        term in message for term in ("timed out", "timeout", "time out", "lifetime expired")
+    ):
+        return f"timed out after {REQUEST_TIMEOUT}s"
+    if "connection refused" in message:
+        return "connection refused"
+    if isinstance(error, (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.resolver.NoNameservers)) or any(
+        term in message for term in (
+            "nxdomain", "noanswer", "does not exist", "domain not found", "dns failure",
+            "failed to resolve", "name or service not known", "nodename nor servname",
+            "nameresolutionerror", "name resolution", "getaddrinfo failed", "no address associated",
+            "dns response does not contain an answer", "all nameservers failed to answer",
+        )
+    ):
+        return "domain not found"
+    http_error = re.search(r"\bhttp(?:error)?[ :]+([45]\d{2})\b", message)
+    if http_error:
+        return f"HTTP {http_error.group(1)}"
+    return "request failed"
 
 
 def extract_domain(url: str) -> str:
@@ -337,7 +426,7 @@ def fetch_page(url: str) -> Dict[str, Any]:
             "error": f"HTTP {r.status_code}" if r.status_code >= 400 else None,
         }
     except Exception as e:
-        return {"ok": False, "status_code": None, "final_url": None, "headers": {}, "html": "", "error": str(e)}
+        return {"ok": False, "status_code": None, "final_url": None, "headers": {}, "html": "", "error": str(e), "error_summary": readable_error(e)}
 
 
 def detect_by_rules(text: str, rules: Dict[str, List[str]]) -> List[Dict[str, Any]]:
@@ -501,8 +590,17 @@ def screenshot_page(url: str, out_dir: Path) -> Dict[str, Any]:
     return result
 
 
-def build_priority(platforms: list, cdns: list, hosting: dict, registrar: dict) -> List[Dict[str, str]]:
+def build_priority(
+    platforms: list, cdns: list, hosting: dict, registrar: dict,
+    shared_platform: Optional[str] = None, registrable_domain: Optional[str] = None,
+) -> List[Dict[str, str]]:
     priority = []
+
+    if shared_platform:
+        return [
+            {"target": shared_platform, "reason": f"The store is on {shared_platform}'s own domain; report the storefront directly to the platform.", "url": SERVICE_COMPLAINT_URLS.get(shared_platform, "")},
+            {"target": "Google Search Removal", "reason": "If the page remains live or indexed, request search-result removal to reduce visibility.", "url": SERVICE_COMPLAINT_URLS["Google Search Removal"]},
+        ]
 
     for p in platforms:
         if p.get("confidence") in {"high", "medium"}:
@@ -519,9 +617,21 @@ def build_priority(platforms: list, cdns: list, hosting: dict, registrar: dict) 
         desc = asn.get("asn_description") or asn.get("network_name") or "visible hosting ASN"
         priority.append({"target": desc, "reason": "Origin/hosting ASN appears visible; host may be able to disable infringing content.", "url": ""})
 
-    if registrar.get("status") != "skipped":
+    if not str(registrar.get("status", "")).startswith("skipped"):
         reg_name = registrar.get("registrar") or "Domain registrar"
-        priority.append({"target": reg_name, "reason": "Registrar abuse contact is useful for trademark impersonation, fake-store, phishing, repeated abuse, or if platform/host does not act.", "url": registrar.get("complaint_url_guess") or registrar.get("rdap_url") or ""})
+        complaint_url = registrar.get("complaint_url_guess") or complaint_url_for_registrar(registrar.get("registrar"))
+        channels = []
+        if registrar.get("abuse_email"):
+            channels.append(f"Email {registrar['abuse_email']}")
+        if registrar.get("abuse_phone"):
+            channels.append(f"Phone {registrar['abuse_phone']}")
+        if complaint_url:
+            channels.append(complaint_url)
+        elif not registrar.get("abuse_email"):
+            lookup_domain = registrable_domain or urlparse(registrar.get("rdap_url") or "").path.rstrip("/").rsplit("/", 1)[-1]
+            complaint_url = f"https://lookup.icann.org/en/lookup?name={lookup_domain}"
+            channels.append(complaint_url)
+        priority.append({"target": reg_name, "kind": "registrar", "reason": "Registrar abuse contact is useful for trademark impersonation, fake-store, phishing, repeated abuse, or if platform/host does not act.", "url": complaint_url or "", "channel": "; ".join(channels)})
     priority.append({"target": "Google Search Removal", "reason": "If the page remains live or indexed, request search-result removal to reduce visibility.", "url": SERVICE_COMPLAINT_URLS["Google Search Removal"]})
     return priority
 
@@ -529,30 +639,70 @@ def build_priority(platforms: list, cdns: list, hosting: dict, registrar: dict) 
 def investigate(url: str, brand_info: BrandInfo, out_dir: Path, do_screenshots: bool = False) -> Dict[str, Any]:
     url = normalize_url(url)
     domain = extract_domain(url)
-    dns_host = urlparse(url).hostname or domain
+    hostname = urlparse(url).hostname or domain
+    shared_platform = shared_platform_for_host(hostname)
     page = fetch_page(url)
-    dns_data = dns_lookup(dns_host)
-    dns_data["queried_host"] = dns_host
-    rdap = rdap_lookup(domain)
+    dns_data = dns_lookup(hostname)
+    dns_data["queried_host"] = hostname
+    if shared_platform:
+        rdap = {
+            "status": f"skipped: domain belongs to {shared_platform}",
+            "rdap_url": None, "raw_available": False, "nameservers": [],
+            "registrar": None,
+            "note": f"This store is on {shared_platform}'s own domain; report it to {shared_platform}, not the domain registrar.",
+        }
+    else:
+        rdap = rdap_lookup(domain)
 
     # Merge RDAP nameservers if DNS NS failed.
     if not dns_data.get("nameservers") and rdap.get("nameservers"):
         dns_data["nameservers"] = rdap["nameservers"]
 
     platforms = detect_platforms(dns_data, page)
+    if shared_platform:
+        # The input's platform-owned hostname is stronger evidence than HTML.
+        platforms = [{
+            "name": shared_platform, "confidence": "high",
+            "matched_keywords": [f"Platform-owned hostname: {hostname}"],
+        }]
     cdns = detect_cdn(dns_data, page)
+    if any(platform["name"] == "Shopify" for platform in platforms):
+        cdns = [cdn for cdn in cdns if cdn["name"] != "Shopify CDN"]
     payment_signal = header_signal_text(page) + "\n" + (page.get("html") or "")
     payments = detect_by_rules(payment_signal, PAYMENT_RULES)
-    hosting = visible_hosting(dns_data, cdns, platforms, page)
+    if shared_platform:
+        hosting = {
+            "status": "platform_hosted", "provider": shared_platform,
+            "note": f"{shared_platform} is both the host and the primary takedown channel.",
+            "complaint_url": SERVICE_COMPLAINT_URLS.get(shared_platform, ""),
+        }
+    else:
+        hosting = visible_hosting(dns_data, cdns, platforms, page)
+
+    # A received HTTP response also confirms reachability when local DNS or
+    # RDAP lookups fail; a 403/404/503 must not be treated as a missing domain.
+    http_status = page.get("status_code")
+    http_responded = isinstance(http_status, int) and 100 <= http_status <= 599
+    domain_not_found = not (
+        any(dns_data.get(key) for key in ("a_records", "aaaa_records", "cname_records"))
+        or rdap.get("raw_available") or rdap.get("registrar") or rdap.get("nameservers")
+        or page.get("ok") or http_responded
+    )
 
     screenshots = {"enabled": False, "files": [], "error": None}
-    if do_screenshots:
-        screenshots = screenshot_page(page.get("final_url") or url, out_dir / "screenshots")
+    if do_screenshots and not domain_not_found:
+        screenshots = screenshot_page(url, out_dir / "screenshots")
 
     data = {
         "generated_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "input_url": url,
         "domain": domain,
+        "hostname": hostname,
+        "registrable_domain": domain,
+        "shared_platform_subdomain": bool(shared_platform),
+        "shared_platform": shared_platform,
+        "domain_not_found": domain_not_found,
+        "error": "domain not found" if domain_not_found else None,
         "brand_info": dataclasses.asdict(brand_info),
         "rdap": rdap,
         "dns": dns_data,
@@ -562,6 +712,9 @@ def investigate(url: str, brand_info: BrandInfo, out_dir: Path, do_screenshots: 
             "final_url": page.get("final_url"),
             "headers": page.get("headers"),
             "error": page.get("error"),
+            "error_summary": page.get("error_summary") or (
+                readable_error(page.get("error"), page.get("status_code")) if not page.get("ok") else None
+            ),
         },
         "detected": {
             "platforms": platforms,
@@ -569,7 +722,10 @@ def investigate(url: str, brand_info: BrandInfo, out_dir: Path, do_screenshots: 
             "payments_possible": payments,
             "hosting": hosting,
         },
-        "complaint_priority": build_priority(platforms, cdns, hosting, rdap),
+        "complaint_priority": [] if domain_not_found else build_priority(
+            platforms, cdns, hosting, rdap,
+            shared_platform=shared_platform, registrable_domain=domain,
+        ),
         "screenshots": screenshots,
     }
     return data
@@ -581,6 +737,25 @@ def md_escape(value: Any) -> str:
     return str(value).replace("|", "\\|")
 
 
+def _report_safe_evidence(value: Any) -> Any:
+    """Keep raw exception details in investigation.json, outside report evidence."""
+    if isinstance(value, list):
+        return [_report_safe_evidence(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if key == "raw_error":
+            continue
+        if key == "error" and (item or value.get("error_summary")):
+            result[key] = value.get("error_summary") or readable_error(item, status_code=value.get("status_code"))
+        elif key == "errors" and isinstance(item, dict):
+            result[key] = {name: readable_error(error) for name, error in item.items()}
+        else:
+            result[key] = _report_safe_evidence(item)
+    return result
+
+
 def deterministic_report(data: Dict[str, Any], lang: str = "en") -> str:
     """Render the same eleven report sections in English or Chinese."""
     if lang not in {"en", "zh"}:
@@ -590,10 +765,29 @@ def deterministic_report(data: Dict[str, Any], lang: str = "en") -> str:
     rdap = data.get("rdap", {})
     dns_data = data.get("dns", {})
     http = data.get("http", {})
-    domain = data.get("domain", "")
-    infringing_url = http.get("final_url") or data.get("input_url") or ""
+    domain = data.get("registrable_domain") or data.get("domain", "")
+    hostname = data.get("hostname") or urlparse(data.get("input_url") or "").hostname or domain
+    infringing_url = data.get("input_url") or ""
+    shared_platform = data.get("shared_platform") if data.get("shared_platform_subdomain") else None
     is_zh = lang == "zh"
     unknown = "未检测到" if is_zh else "Not detected"
+    notices = []
+    http_failed = http.get("ok") is False or (http.get("status_code") or 0) >= 400
+    if http_failed:
+        reason = http.get("error_summary") or readable_error(http.get("error"), status_code=http.get("status_code"))
+        notices.append(
+            f"> **警告：页面无法加载（{reason}）。提交投诉前，请自行截图留存证据。**"
+            if is_zh else f"> **Warning: The page could not be loaded ({reason}). Capture your own screenshot as evidence before filing.**"
+        )
+    if shared_platform:
+        notices.append(
+            f"> **该店铺位于 {shared_platform} 自有域名下；请向 {shared_platform} 举报，不要向域名注册商投诉。**"
+            if is_zh else f"> **This store is on {shared_platform}'s own domain; report it to {shared_platform}, not the domain registrar.**"
+        )
+    notice_text = "\n\n".join(notices)
+    redirect_line = ""
+    if http.get("final_url") and http["final_url"] != infringing_url:
+        redirect_line = f"- {'重定向至' if is_zh else 'Redirects to'}: {http['final_url']}\n"
 
     def det_list(items: list) -> str:
         if not items:
@@ -616,22 +810,33 @@ def deterministic_report(data: Dict[str, Any], lang: str = "en") -> str:
         screenshot_lines = "- 未生成截图，或截图失败。\n" if is_zh else "- No screenshots generated, or capture failed.\n"
 
     priority_lines = ""
-    for idx, p in enumerate(data.get("complaint_priority", []), start=1):
+    priorities = data.get("complaint_priority", [])
+    if shared_platform:
+        priorities = build_priority([], [], {}, {}, shared_platform=shared_platform, registrable_domain=domain)
+    for idx, p in enumerate(priorities, start=1):
         reason = p.get("reason", "")
         if is_zh:
-            if p.get("target") in {i.get("name") for i in detected.get("platforms", [])}:
+            if p.get("target") == shared_platform or p.get("target") in {i.get("name") for i in detected.get("platforms", [])}:
                 reason = "优先联系已识别的建站平台；平台可能直接管理店铺或商品页面。"
             elif p.get("target") == "Cloudflare":
                 reason = "检测到 Cloudflare，可并行提交滥用、版权或商标投诉；其可能转交主机商或网站运营者。"
             elif p.get("target") == "Google Search Removal":
                 reason = "如果页面仍可访问或已被收录，可申请移除搜索结果，减少曝光。"
-            elif p.get("target") == rdap.get("registrar") or p.get("target") == "Domain registrar":
+            elif p.get("kind") == "registrar" or p.get("target") == rdap.get("registrar") or p.get("target") == "Domain registrar":
                 reason = "注册商滥用渠道可用于反馈品牌冒用、假店、钓鱼或反复滥用，也可在平台或主机商未处理时跟进。"
             elif detected.get("hosting", {}).get("status") == "visible":
                 reason = "公开数据可见主机网络信息；可进一步确认主机商及其内容移除渠道。"
-        url = (("；入口：" if is_zh else "; complaint channel: ") + str(p["url"])) if p.get("url") else ""
+        channel = p.get("channel") or p.get("url") or ""
+        if p.get("kind") == "registrar" or p.get("target") in {rdap.get("registrar"), "Domain registrar"}:
+            registrar_priority = build_priority([], [], {}, rdap, registrable_domain=domain)
+            registrar_entry = next((item for item in registrar_priority if item.get("kind") == "registrar"), None)
+            if registrar_entry:
+                channel = registrar_entry.get("channel", "")
+        if channel:
+            reason = reason.rstrip(" .。;；")
+            reason = f"{reason}（入口：{channel}）" if is_zh else f"{reason}. Channel: {channel}"
         separator = "：" if is_zh else ": "
-        priority_lines += f"{idx}. **{p.get('target')}**{separator}{reason}{url}\n"
+        priority_lines += f"{idx}. **{p.get('target')}**{separator}{reason}\n"
     if not priority_lines:
         priority_lines = "- 暂无投诉渠道建议。\n" if is_zh else "- No complaint channels identified.\n"
 
@@ -639,13 +844,13 @@ def deterministic_report(data: Dict[str, Any], lang: str = "en") -> str:
     needs_dmca = "copyright" in infringement or "盗图" in infringement or "image" in infringement
     needs_tm = "trademark" in infringement or "商标" in infringement or "brand" in infringement
 
-    dmca = dmca_template(brand, domain, infringing_url) if needs_dmca else (
+    dmca = dmca_template(brand, hostname, infringing_url) if needs_dmca else (
         "不适用：用户未选择盗图 / copyright 侵权类型。" if is_zh else "Not applicable: copyright infringement was not selected."
     )
-    tm = trademark_template(brand, domain, infringing_url) if needs_tm else (
+    tm = trademark_template(brand, hostname, infringing_url) if needs_tm else (
         "不适用：用户未选择商标 / trademark 侵权类型。" if is_zh else "Not applicable: trademark infringement was not selected."
     )
-    amazon = amazon_case_template(brand, domain, infringing_url)
+    amazon = amazon_case_template(brand, hostname, infringing_url)
     hosting = detected.get("hosting") or {}
     if hosting.get("status") == "platform_hosted":
         provider = hosting.get("provider") or unknown
@@ -662,25 +867,40 @@ def deterministic_report(data: Dict[str, Any], lang: str = "en") -> str:
         hosting_note = hosting.get("note") or ("请结合以下网络信息人工核实主机服务商。" if is_zh else "Review the network information below to verify the hosting provider.")
         if is_zh and hosting_note == "No A records found in basic DNS lookup.":
             hosting_note = "基础 DNS 查询未找到 A 记录，无法据此确认主机服务商。"
-    rdap_note = rdap.get("note") or ("无补充说明。" if is_zh else "No additional notes.")
+    rdap_note = rdap.get("note") or rdap.get("status") or ("无补充说明。" if is_zh else "No additional notes.")
     if is_zh:
-        if rdap.get("status") == "skipped":
+        if shared_platform:
+            rdap_note = f"该域名属于 {shared_platform}，已跳过注册商 RDAP 查询。"
+        elif rdap.get("status") == "skipped":
             rdap_note = "输入为 IP 地址，已跳过域名 RDAP 查询。"
         elif rdap_note == "RDAP lookup failed or returned no usable data. Keep DNS nameservers and ICANN/RDAP link for manual review.":
             rdap_note = "RDAP 查询失败或未返回可用数据，请结合 DNS 名称服务器及 ICANN/RDAP 链接人工核实。"
-    http_note = http.get("error") or ("无错误。" if is_zh else "No error recorded.")
+    http_note = (
+        http.get("error_summary") or readable_error(http.get("error"), status_code=http.get("status_code"))
+        if http_failed or http.get("error") else ("无错误。" if is_zh else "No error recorded.")
+    )
+    hosting_json = json.dumps(_report_safe_evidence(hosting), ensure_ascii=False, indent=2)
+    registrar_complaint = rdap.get("complaint_url_guess") or (
+        "未检测到，可使用 registrar abuse email 或 ICANN 结果人工查询"
+        if is_zh else "Not detected; review the registrar abuse contact or ICANN records manually."
+    )
+    if str(rdap.get("status", "")).startswith("skipped"):
+        registrar_complaint = "不适用：已跳过注册商 RDAP 查询。" if is_zh else "Not applicable: registrar RDAP was skipped."
 
     if not is_zh:
         return f"""# Independent Site IP Investigation Report
+
+{notice_text}
 
 Generated at (UTC): {data.get('generated_at_utc')}
 
 ## 1. Basic Information
 
-- Target domain or IP: {domain}
+- Hostname: {hostname}
+- Registrable domain: {domain}
+- Shared platform subdomain: {str(bool(data.get('shared_platform_subdomain'))).lower()}
 - Input URL: {data.get('input_url')}
-- Final URL: {http.get('final_url') or 'Unavailable'}
-- HTTP status: {http.get('status_code') if http.get('status_code') is not None else 'Unavailable'}
+{redirect_line}- HTTP status: {http.get('status_code') if http.get('status_code') is not None else 'Unavailable'}
 - HTTP error: {http_note}
 - Brand: {brand.get('brand') or 'Not provided'}
 - Company: {brand.get('company') or 'Not provided'}
@@ -696,12 +916,12 @@ Generated at (UTC): {data.get('generated_at_utc')}
 - Created: {rdap.get('created_date') or unknown}
 - Updated: {rdap.get('updated_date') or unknown}
 - RDAP URL: {rdap.get('rdap_url') or 'Not applicable or unavailable'}
-- Registrar complaint URL: {rdap.get('complaint_url_guess') or 'Not detected; review the registrar abuse contact or RDAP/ICANN records manually.'}
+- Registrar complaint URL: {registrar_complaint}
 - RDAP note: {rdap_note}
 
 ## 3. DNS / Name Servers
 
-- Queried hostname or IP: {dns_data.get('queried_host') or domain}
+- Queried hostname or IP: {dns_data.get('queried_host') or hostname}
 - Name servers: {', '.join(dns_data.get('nameservers') or []) or unknown}
 - A records: {', '.join(dns_data.get('a_records') or []) or unknown}
 - AAAA records: {', '.join(dns_data.get('aaaa_records') or []) or unknown}
@@ -720,7 +940,7 @@ Generated at (UTC): {data.get('generated_at_utc')}
 {hosting_note}
 
 ```json
-{json.dumps(hosting, ensure_ascii=False, indent=2)}
+{hosting_json}
 ```
 
 ### Possible payment providers
@@ -767,14 +987,17 @@ Generated at (UTC): {data.get('generated_at_utc')}
 
     return f"""# 独立站侵权调查报告
 
+{notice_text}
+
 生成时间：{data.get('generated_at_utc')}
 
 ## 1. 基础信息
 
-- 目标域名或 IP：{domain}
+- 主机名（hostname）：{hostname}
+- 可注册域名（registrable_domain）：{domain}
+- 平台子域名（shared_platform_subdomain）：{str(bool(data.get('shared_platform_subdomain'))).lower()}
 - 输入 URL：{data.get('input_url')}
-- 最终访问 URL：{http.get('final_url')}
-- HTTP 状态：{http.get('status_code')}
+{redirect_line}- HTTP 状态：{http.get('status_code')}
 - HTTP 错误：{http_note}
 - 品牌：{brand.get('brand')}
 - 公司：{brand.get('company')}
@@ -790,12 +1013,12 @@ Generated at (UTC): {data.get('generated_at_utc')}
 - Created：{rdap.get('created_date') or '未检测到'}
 - Updated：{rdap.get('updated_date') or '未检测到'}
 - RDAP URL：{rdap.get('rdap_url') or '不适用或不可用'}
-- Registrar Complaint URL：{rdap.get('complaint_url_guess') or '未检测到，可使用 registrar abuse email 或 RDAP/ICANN 结果人工查询'}
+- Registrar Complaint URL：{registrar_complaint}
 - RDAP 说明：{rdap_note}
 
 ## 3. DNS / Name Server
 
-- 查询的主机名或 IP：{dns_data.get('queried_host') or domain}
+- 查询的主机名或 IP：{dns_data.get('queried_host') or hostname}
 - Name Server：{', '.join(dns_data.get('nameservers') or []) or '未检测到'}
 - A Records：{', '.join(dns_data.get('a_records') or []) or '未检测到'}
 - AAAA Records：{', '.join(dns_data.get('aaaa_records') or []) or '未检测到'}
@@ -814,7 +1037,7 @@ Generated at (UTC): {data.get('generated_at_utc')}
 {hosting_note}
 
 ```json
-{json.dumps(hosting, ensure_ascii=False, indent=2)}
+{hosting_json}
 ```
 
 ### 可能的支付服务商
@@ -1021,14 +1244,20 @@ Requirements:
 - Do not invent facts, contacts, or evidence. Label uncertain providers as possible.
 - If hosting.status is hidden_by_cloudflare, do not guess the origin host.
 - If hosting.status is platform_hosted, identify that platform as the host and primary takedown channel.
-- Use http.final_url, or input_url if unavailable, as the Infringing Page URL in every template.
+- Show hostname, registrable_domain, and shared_platform_subdomain in basic information. The hostname identifies the storefront; the registrable domain is for RDAP only.
+- Use input_url as the Infringing Page URL in every template and hostname as the infringing website/domain. Never substitute http.final_url in templates.
+- If http.final_url differs from input_url, add "Redirects to: <final>" in basic information only.
+- If shared_platform_subdomain is true, clearly state: "This store is on <Platform>'s own domain; report it to <Platform>, not the domain registrar." Use shared_platform for <Platform>, translate this notice for Chinese reports, and show only the platform first and Google Search Removal second in complaint priority. Do not recommend the registrar or CDN for shared platform subdomains.
+- If http.ok is false, prominently warn at the top: "The page could not be loaded (<short reason>). Capture your own screenshot as evidence before filing." Translate this warning for Chinese reports. Use the readable error in the evidence, or HTTP status if present; never expose raw exceptions.
+- Registrar priority must show Email <abuse_email> and phone when known, plus the registrar complaint URL when known. If neither email nor complaint URL is available, use https://lookup.icann.org/en/lookup?name=<registrable_domain>, not rdap.org.
+- Format priority entries as reason（入口：channel） in Chinese and reason. Channel: channel in English, removing duplicate sentence punctuation.
 - Include these 11 numbered sections in {language}: Basic information; Domain registrar / RDAP;
   DNS / nameservers; Service providers; Screenshot evidence; Recommended complaint priority;
   Evidence checklist; English Copyright / DMCA complaint template; English Trademark complaint
   template; Amazon Buy Box / Featured Offer case template; Notes and limitations.
 
 JSON:
-{json.dumps(data, ensure_ascii=False, indent=2)}
+{json.dumps(_report_safe_evidence(data), ensure_ascii=False, indent=2)}
 """
         if provider == "openai":
             from openai import OpenAI
@@ -1057,24 +1286,67 @@ JSON:
         return None
 
 
-def write_pdf(markdown_text: str, pdf_path: Path) -> Tuple[bool, Optional[str]]:
+def write_pdf(
+    markdown_text: str, pdf_path: Path, error_details: Optional[Dict[str, str]] = None
+) -> Tuple[bool, Optional[str]]:
+    dependencies_loaded = False
     try:
-        import markdown2
-        from weasyprint import HTML
-        body = markdown2.markdown(markdown_text, extras=["tables", "fenced-code-blocks"])
+        # WeasyPrint prints an installation banner to stdout before raising on
+        # missing native libraries. Keep stdout parseable as CLI JSON; our
+        # warning goes to stderr and the exception is retained in the evidence.
+        with redirect_stdout(io.StringIO()):
+            import markdown2
+            from weasyprint import HTML
+        dependencies_loaded = True
+        body = markdown2.markdown(
+            markdown_text,
+            extras=["tables", "fenced-code-blocks", "break-on-newline", "cuddled-lists", "code-friendly"],
+        )
         html = f"""
 <html><head><meta charset='utf-8'>
 <style>
-body {{ font-family: Arial, sans-serif; line-height: 1.45; margin: 32px; }}
-h1, h2, h3 {{ color: #222; }}
+@page {{ size: A4; margin: 20mm;
+  @bottom-right {{ content: counter(page); font-size: 9pt; color: #666; }}
+}}
+body {{ font-family: Arial, 'Noto Sans CJK SC', 'PingFang SC', 'Hiragino Sans GB', sans-serif;
+       font-size: 11pt; line-height: 1.45; margin: 0; overflow-wrap: anywhere; }}
+h1, h2, h3 {{ color: #222; break-after: avoid; }}
+p, li {{ orphans: 2; widows: 2; }}
+p {{ break-inside: avoid; }}
 code, pre {{ background: #f5f5f5; padding: 2px 4px; }}
-pre {{ padding: 10px; overflow-wrap: break-word; white-space: pre-wrap; }}
+pre {{ padding: 10px; font-size: 9pt; overflow-wrap: anywhere; white-space: pre-wrap; }}
 </style></head><body>{body}</body></html>
 """
         HTML(string=html).write_pdf(str(pdf_path))
         return True, None
     except Exception as e:
-        return False, str(e)
+        raw_error = str(e) or type(e).__name__
+        error_number = getattr(e, "errno", None)
+        if isinstance(e, ModuleNotFoundError):
+            error = (
+                "PDF needs Python packages. Run: python -m pip install markdown2 weasyprint. "
+                "The Markdown report was still written."
+            )
+        elif isinstance(e, PermissionError) or error_number in {errno.EACCES, errno.EPERM, errno.EROFS}:
+            error = "Could not write PDF: permission denied. The Markdown report was still written."
+        elif error_number in {errno.ENOSPC, errno.EDQUOT}:
+            error = "Could not write PDF: not enough disk space. The Markdown report was still written."
+        elif (isinstance(e, OSError) and not dependencies_loaded) or any(
+            term in raw_error.lower() for term in (
+                "cannot load library", "dlopen", "missing native dependency", "missing system dependency",
+            )
+        ):
+            error = (
+                "PDF needs system libraries for WeasyPrint. macOS: brew install pango; "
+                "Ubuntu/Debian: apt install libpango-1.0-0 libpangoft2-1.0-0. "
+                "The Markdown report was still written."
+            )
+        else:
+            error = "PDF generation failed. The Markdown report was still written. See investigation.json for details."
+        print(f"WARNING: {error}", file=sys.stderr)
+        if error_details is not None:
+            error_details.update({"error": error, "raw_error": raw_error})
+        return False, error
 
 
 def save_single_report(
@@ -1083,23 +1355,32 @@ def save_single_report(
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / "investigation.json"
     json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    paths = {"json": str(json_path)}
+    if data.get("domain_not_found"):
+        return paths
     report = llm_report(data, provider=llm, lang=lang) if llm != "none" else None
     if not report:
         report = deterministic_report(data, lang=lang)
     md_path = out_dir / "report.md"
     md_path.write_text(report, encoding="utf-8")
-    paths = {"json": str(json_path), "markdown": str(md_path)}
+    paths["markdown"] = str(md_path)
     if make_pdf:
         pdf_path = out_dir / "report.pdf"
-        ok, err = write_pdf(report, pdf_path)
+        ok, err = write_pdf(report, pdf_path, error_details=data.setdefault("pdf", {}))
         if ok:
             paths["pdf"] = str(pdf_path)
         else:
             paths["pdf_error"] = err or "unknown PDF error"
+        json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return paths
 
 
 def single_mode(args: argparse.Namespace) -> int:
+    try:
+        url = normalize_url(args.url)
+    except InvalidTarget as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     brand = BrandInfo(
         brand=args.brand or "",
         company=args.company or "",
@@ -1108,23 +1389,39 @@ def single_mode(args: argparse.Namespace) -> int:
         infringement=args.infringement or "copyright+trademark",
         affects_buybox=args.affects_buybox or "yes",
     )
-    domain = extract_domain(args.url)
-    root = Path(args.output_dir or "reports") / f"{domain.replace('.', '_')}_{utc_timestamp()}"
-    data = investigate(args.url, brand, root, do_screenshots=args.screenshots)
+    hostname = urlparse(url).hostname
+    root = Path(args.output_dir or "reports") / f"{hostname.replace('.', '_').replace(':', '_')}_{utc_timestamp()}"
+    data = investigate(url, brand, root, do_screenshots=args.screenshots)
     paths = save_single_report(data, root, llm=args.llm, make_pdf=args.pdf, lang=args.lang)
     print(json.dumps({"output_dir": str(root), "paths": paths, "summary": summarize_for_console(data)}, ensure_ascii=False, indent=2))
+    if data.get("domain_not_found"):
+        print(
+            f"Could not confirm {hostname} from DNS, RDAP or HTTP. "
+            "Check the URL for typos and retry; network or lookup service failures "
+            "can also cause this result.",
+            file=sys.stderr,
+        )
+        return 3
     return 0
 
 
 def summarize_for_console(data: Dict[str, Any]) -> Dict[str, Any]:
     det = data.get("detected", {})
+    http = data.get("http", {})
     return {
         "domain": data.get("domain"),
+        "hostname": data.get("hostname") or urlparse(data.get("input_url") or "").hostname or data.get("domain"),
+        "registrable_domain": data.get("registrable_domain") or data.get("domain"),
+        "shared_platform_subdomain": data.get("shared_platform_subdomain", False),
+        "rdap_status": data.get("rdap", {}).get("status") or ("found" if data.get("rdap", {}).get("raw_available") else "unavailable"),
         "registrar": data.get("rdap", {}).get("registrar"),
         "abuse_email": data.get("rdap", {}).get("abuse_email"),
         "cdn": [x.get("name") for x in det.get("cdn", [])],
         "platform": [x.get("name") for x in det.get("platforms", [])],
         "hosting_status": det.get("hosting", {}).get("status"),
+        "error": "domain not found" if data.get("domain_not_found") else (
+            (http.get("error_summary") or readable_error(http.get("error"), http.get("status_code"))) if http.get("ok") is False or http.get("error") else ""
+        ),
     }
 
 
@@ -1137,10 +1434,12 @@ def batch_mode(args: argparse.Namespace) -> int:
         for idx, row in enumerate(reader, start=1):
             url = row.get("url") or row.get("URL") or row.get("domain") or row.get("Domain") or ""
             summary = {
-                "url": url, "domain": "", "registrar": "", "abuse_email": "",
+                "url": url, "domain": "", "hostname": "", "registrable_domain": "",
+                "shared_platform_subdomain": False, "rdap_status": "", "registrar": "", "abuse_email": "",
                 "cdn": [], "platform": [], "hosting_status": "", "output_dir": "",
                 "report_md": "", "report_pdf": "", "error": "",
             }
+            out_dir = batch_root / f"{idx:03d}_invalid"
             try:
                 brand = BrandInfo(
                     brand=row.get("brand") or "",
@@ -1151,23 +1450,33 @@ def batch_mode(args: argparse.Namespace) -> int:
                     affects_buybox=row.get("affects_buybox") or "yes",
                 )
                 domain = extract_domain(url)
+                hostname = urlparse(normalize_url(url)).hostname
                 summary["domain"] = domain
-                out_dir = batch_root / f"{idx:03d}_{domain.replace('.', '_')}"
+                summary["hostname"] = hostname
+                summary["registrable_domain"] = domain
+                out_dir = batch_root / f"{idx:03d}_{hostname.replace('.', '_').replace(':', '_')}"
                 summary["output_dir"] = str(out_dir)
                 data = investigate(url, brand, out_dir, do_screenshots=args.screenshots)
                 summary.update(summarize_for_console(data))
-                summary["error"] = data.get("http", {}).get("error") or ""
                 paths = save_single_report(data, out_dir, llm=args.llm, make_pdf=args.pdf, lang=args.lang)
                 summary["report_md"] = paths.get("markdown", "")
                 summary["report_pdf"] = paths.get("pdf", "")
+                if paths.get("pdf_error"):
+                    summary["error"] = "; ".join(filter(None, [summary["error"], paths["pdf_error"]]))
             except Exception as e:
-                summary["error"] = str(e) or type(e).__name__
+                summary["error"] = readable_error(e)
+                summary["output_dir"] = str(out_dir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                (out_dir / "investigation.json").write_text(json.dumps({
+                    "input_url": url, "error": summary["error"],
+                    "raw_error": str(e) or type(e).__name__,
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
             rows_out.append(summary)
             print(json.dumps(summary, ensure_ascii=False))
 
     summary_csv = batch_root / "batch_summary.csv"
     with summary_csv.open("w", newline="", encoding="utf-8") as f:
-        fieldnames = ["url", "domain", "registrar", "abuse_email", "cdn", "platform", "hosting_status", "output_dir", "report_md", "report_pdf", "error"]
+        fieldnames = ["url", "domain", "hostname", "registrable_domain", "shared_platform_subdomain", "rdap_status", "registrar", "abuse_email", "cdn", "platform", "hosting_status", "output_dir", "report_md", "report_pdf", "error"]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows_out)
@@ -1214,7 +1523,7 @@ def batch_summary_markdown(rows: List[Dict[str, Any]], lang: str = "en") -> str:
         if lang == "zh":
             hosting = hosting_labels.get(hosting, hosting)
         cells = [
-            r.get("domain") or r.get("url"), r.get("registrar"), r.get("abuse_email"),
+            r.get("hostname") or r.get("domain") or r.get("url"), r.get("registrar"), r.get("abuse_email"),
             ", ".join(r.get("platform") or []), ", ".join(r.get("cdn") or []),
             hosting, r.get("report_md"), r.get("error"),
         ]
@@ -1224,7 +1533,7 @@ def batch_summary_markdown(rows: List[Dict[str, Any]], lang: str = "en") -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Independent Site IP Investigator for brand/IP enforcement.")
-    p.add_argument("--version", action="version", version="%(prog)s 1.1.0")
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument("--url", help="Target infringing URL or domain")
     group.add_argument("--csv", help="Batch CSV path. Required columns: url; optional: brand,company,amazon_url,official_url,infringement,affects_buybox")

@@ -188,7 +188,7 @@ def test_fetch_page_retains_html_and_records_http_errors(monkeypatch, status):
     assert page["status_code"] == status
     assert page["html"] == "<html>Evidence</html>"
     assert bool(page["error"]) == (status >= 400)
-    assert calls[0]["headers"]["User-Agent"] == "IndependentSiteIPInvestigator/1.1 (+https://github.com/LuckeeAI/independent-site-ip-investigator)"
+    assert calls[0]["headers"]["User-Agent"] == "IndependentSiteIPInvestigator/1.2.0 (+https://github.com/LuckeeAI/independent-site-ip-investigator)"
 
 
 def test_fetch_page_network_failure_is_not_ok(monkeypatch):
